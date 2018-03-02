@@ -16,26 +16,37 @@ NO_PRIORITY = LOW*20
 DAYS = ('monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday')
 
 DB_NAME = 'tasks.db'
+SCHEMA = 'schema.sql'
 
 
 class Database:
+    """
+    Tasks are stored using task_ids. Multiple events can have the same task_id, but each task must have a unique task_id
+    """
     def __init__(self):
         self.conn = sq3.connect(DB_NAME)
         self.c = self.conn.cursor()
         self.create_tables()
 
     def create_tables(self):
-        with open('schema.sql', 'r') as f:
+        with open(SCHEMA, 'r') as f:
             for command in ''.join(f).split(';'):
                 self.c.execute(command)
         self.conn.commit()
 
     def add_task(self, task):
-        self.c.execute("INSERT INTO tasks(task_name, duration, due_date, priority) VALUES(?, ?, ?, ?)",
-                       (task.name, minutes_from_timedelta(task.duration), str_from_datetime(task.due_date), task.priority))
-        self.c.execute("SELECT last_insert_row_id()")
-        self.conn.commit()
-        return self.c.fetchone()
+        if task.task_id is not None:
+            self.c.execute("INSERT INTO tasks(task_id, task_name, duration, due_date, priority) VALUES(?, ?, ?, ?, ?)",
+                           (task.task_id, task.name, minutes_from_timedelta(task.duration),
+                            str_from_datetime(task.due_date), task.priority))
+            self.conn.commit()
+        else:
+            self.c.execute("INSERT INTO tasks(task_name, duration, due_date, priority) VALUES(?, ?, ?, ?)",
+                           (task.name, minutes_from_timedelta(task.duration), str_from_datetime(task.due_date), task.priority))
+            self.c.execute("SELECT last_insert_row_id()")
+            self.conn.commit()
+            task.task_id = self.c.fetchone()
+        return task.task_id
 
     def get_tasks(self):
         self.c.execute("SELECT * FROM tasks")
@@ -43,27 +54,40 @@ class Database:
                 for (_id, name, duration, due_date, priority)
                 in self.c]
 
-    def add_event(self, event, task_id=None):
-        if task_id is None:
-            task_id = self.add_task(event)
-        self.c.execute("""INSERT INTO events(
-        task_id, start_time, end_time, monday, tuesday, wednesday, thursday, friday, saturday, sunday)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                       [task_id, event.start_time, event.end_time] + [event.which_days[day] for day in DAYS])
-        self.c.execute("SELECT last_insert_row_id()")
-        self.conn.commit()
-        return self.c.fetchone()
+    def add_event(self, event):
+        if event.task_id is None:
+            # Update the task_id, and add task to db
+            self.add_task(event)
+        if event.event_id is None:
+            self.c.execute("""INSERT INTO events(
+            task_id, start_time, end_time, monday, tuesday, wednesday, thursday, friday, saturday, sunday)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           [event.task_id, event.start_time, event.end_time] + [event.which_days[day] for day in DAYS])
+            self.conn.commit()
+            self.c.execute("SELECT last_insert_row_id()")
+            event.event_id=self.c.fetchone()
+        else:
+            self.c.execute("""INSERT INTO event(
+            event_id, task_id, start_time, end_time, monday, tuesday, wednesday, thursday, friday, saturday, sunday)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           [event.event_id, event.task_id, event.start_time, event.end_time] +
+                           [event.which_days[day] for day in DAYS])
+            self.conn.commit()
+        return event.event_id
 
     def get_events(self):
         self.c.execute("""SELECT
-        task_name, duration, due_date, priority, start_time, end_time,
+        task_id, event_id, task_name, duration, due_date, priority, start_time, end_time,
         monday, tuesday, wednesday, thursday, friday, saturday, sunday
         FROM events NATURAL JOIN tasks ON task_id""")
-        return [Event(Task(task_name, datetime.timedelta(minutes=duration), datetime_from_str(due_date), priority),
-                      start_time, end_time, monday, tuesday, wednesday, thursday, friday, saturday, sunday)
-                for (task_name, duration, due_date, priority, start_time, end_time,
+        return [Event(
+            Task(
+                task_name, datetime.timedelta(minutes=duration), datetime_from_str(due_date),priority, task_id=task_id
+            ), start_time, end_time, monday, tuesday, wednesday, thursday, friday, saturday, sunday, event_id)
+                for (task_id, event_id, task_name, duration, due_date, priority, start_time, end_time,
                      monday, tuesday, wednesday, thursday, friday, saturday, sunday)
                 in self.c]
+
 
 class Anytime:
     """
@@ -89,6 +113,11 @@ class Anytime:
 
 
 class Calendar:
+    """
+    Keeps track of everything that determines how events can be organized
+    Make calls to this to add new tasks and events
+    Make calls to this to find the final event list
+    """
     # Running tally of what is actually happening
     def __init__(self, database=None):
         self.tasks = list()
@@ -109,9 +138,6 @@ class Calendar:
         """
         if event.recurring:
             self.recurring_events.append(event)
-            # for day in DAYS:
-            #     if getattr(event, day):
-            #         getattr(self.recurring_events, day).append(event)
         else:
             self.definite_events.append(event)
 
@@ -119,7 +145,9 @@ class Calendar:
         """
         Gets events by day, sorted by endtime
         """
-        return {day: sorted((event for event in self.recurring_events if event.day), key=lambda e: e.endtime.time()) for day in DAYS}
+        return {day:
+                    sorted((event for event in self.recurring_events if event.day), key=lambda e: e.endtime.time())
+                for day in DAYS}
 
     def check_recurring_conflict(self):
         """
@@ -182,17 +210,25 @@ class Calendar:
     def assign_all_events(self, break_time=datetime.timedelta(minutes=15)):
         # First assign the 'definite' events
         # Then do 1d bin sorting using the tasks, making sure to keep track of recurring events
-        raise RuntimeError("Hasn't yet been implemented")
+        # raise RuntimeError("Hasn't yet been implemented")
+        # This implementation will instead assume that all tasks can be broken up into pieces
+        if self.check_recurring_conflict():
+            raise ValueError("Can't determine schedule because overlapping days")
+        break_task = Task('BREAK', duration=break_time)
+        # Find the max date, make a schedule from now to last date
+        latest_date = datetime.datetime.now().date()
+        # for event_date in map(lambda d:d.end_time.date(), )
 
 class Task:
     # A currently unassigned event, that hasn't yet been assigned
-    def __init__(self, name, duration=datetime.timedelta(minutes=30), due_date=Anytime(), priority=NO_PRIORITY):
+    def __init__(self, name, duration=datetime.timedelta(minutes=30), due_date=Anytime(), priority=NO_PRIORITY, task_id=None):
         self.name = name
         self.due_date = due_date
         self.priority = priority  # Priority is determined numerically. Low numbers are high priorities
         if not isinstance(duration, datetime.timedelta):
             duration = datetime.timedelta(duration)
         self.duration = duration
+        self.task_id = task_id
 
     def time_after(self, start=None):
         """
@@ -223,7 +259,7 @@ class Task:
 class Event(Task):
     # Something that is presumed to be happening at a given time
     def __init__(self, task, start_time, end_time=None, monday=False, tuesday=False, wednesday=False,
-                 thursday=False, friday=False, saturday=False, sunday=False):
+                 thursday=False, friday=False, saturday=False, sunday=False, event_id=None):
         super().__init__(**task.__dict__)
         self.start_time = start_time
         if end_time is None:
@@ -237,6 +273,7 @@ class Event(Task):
             setattr(self, day_name, day_val)
             self.which_days[day_name] = day_val
         self.recurring = any(day_vals)
+        self.event_id = event_id
 
     def generate_recurring(self, date):
         """
@@ -264,3 +301,4 @@ class Event(Task):
 if __name__ == '__main__':
     db = Database()
     cal = Calendar(db)
+
