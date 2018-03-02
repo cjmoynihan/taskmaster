@@ -26,7 +26,7 @@ class Database:
 
     def create_tables(self):
         with open('schema.sql', 'r') as f:
-            for command in ''.join(line for line in f).split(';'):
+            for command in ''.join(f).split(';'):
                 self.c.execute(command)
         self.conn.commit()
 
